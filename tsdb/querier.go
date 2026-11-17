@@ -17,10 +17,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"slices"
 
 	"github.com/oklog/ulid/v2"
+
+	"github.com/prometheus/common/promslog"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
@@ -40,6 +43,7 @@ type blockBaseQuerier struct {
 	index      IndexReader
 	chunks     ChunkReader
 	tombstones tombstones.Reader
+	logger     *slog.Logger
 
 	closed bool
 
@@ -68,6 +72,10 @@ func newBlockBaseQuerier(b BlockReader, mint, maxt int64) (*blockBaseQuerier, er
 	if tombsr == nil {
 		tombsr = tombstones.NewMemTombstones()
 	}
+	logger := promslog.NewNopLogger()
+	if gl, ok := b.(interface{ Logger() *slog.Logger }); ok && gl.Logger() != nil {
+		logger = gl.Logger()
+	}
 	return &blockBaseQuerier{
 		blockID:    b.Meta().ULID,
 		mint:       mint,
@@ -75,6 +83,7 @@ func newBlockBaseQuerier(b BlockReader, mint, maxt int64) (*blockBaseQuerier, er
 		index:      indexr,
 		chunks:     chunkr,
 		tombstones: tombsr,
+		logger:     logger,
 	}, nil
 }
 
@@ -171,7 +180,7 @@ func NewBlockQuerier(b BlockReader, mint, maxt int64) (storage.Querier, error) {
 }
 
 func (q *blockQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, ms ...*labels.Matcher) storage.SeriesSet {
-	return selectSeriesSet(ctx, sortSeries, hints, ms, q.index, q.chunks, q.tombstones, q.mint, q.maxt)
+	return selectSeriesSet(ctx, sortSeries, hints, ms, q.blockID, q.index, q.chunks, q.tombstones, q.mint, q.maxt, q.logger)
 }
 
 // chunkCacheEnabler is an optional interface implemented by chunk readers that
@@ -189,7 +198,7 @@ func enableChunkCache(cr ChunkReader) {
 }
 
 func selectSeriesSet(ctx context.Context, sortSeries bool, hints *storage.SelectHints, ms []*labels.Matcher,
-	index IndexReader, chunks ChunkReader, tombstones tombstones.Reader, mint, maxt int64,
+	blockID ulid.ULID, index IndexReader, chunks ChunkReader, tombstones tombstones.Reader, mint, maxt int64, logger *slog.Logger,
 ) storage.SeriesSet {
 	disableTrimming := false
 	sharded := hints != nil && hints.ShardCount > 0
@@ -215,11 +224,11 @@ func selectSeriesSet(ctx context.Context, sortSeries bool, hints *storage.Select
 		disableTrimming = hints.DisableTrimming
 		if hints.Func == "series" {
 			// When you're only looking up metadata (for example series API), you don't need to load any chunks.
-			return newBlockSeriesSet(index, newNopChunkReader(), tombstones, p, mint, maxt, disableTrimming)
+			return newBlockSeriesSet(blockID, index, newNopChunkReader(), tombstones, p, mint, maxt, disableTrimming, logger)
 		}
 	}
 
-	return newBlockSeriesSet(index, chunks, tombstones, p, mint, maxt, disableTrimming)
+	return newBlockSeriesSet(blockID, index, chunks, tombstones, p, mint, maxt, disableTrimming, logger)
 }
 
 // blockChunkQuerier provides chunk querying access to a single block database.
@@ -240,11 +249,11 @@ func NewBlockChunkQuerier(b BlockReader, mint, maxt int64) (storage.ChunkQuerier
 }
 
 func (q *blockChunkQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, ms ...*labels.Matcher) storage.ChunkSeriesSet {
-	return selectChunkSeriesSet(ctx, sortSeries, hints, ms, q.blockID, q.index, q.chunks, q.tombstones, q.mint, q.maxt)
+	return selectChunkSeriesSet(ctx, sortSeries, hints, ms, q.blockID, q.index, q.chunks, q.tombstones, q.mint, q.maxt, q.logger)
 }
 
 func selectChunkSeriesSet(ctx context.Context, sortSeries bool, hints *storage.SelectHints, ms []*labels.Matcher,
-	blockID ulid.ULID, index IndexReader, chunks ChunkReader, tombstones tombstones.Reader, mint, maxt int64,
+	blockID ulid.ULID, index IndexReader, chunks ChunkReader, tombstones tombstones.Reader, mint, maxt int64, logger *slog.Logger,
 ) storage.ChunkSeriesSet {
 	disableTrimming := false
 	sharded := hints != nil && hints.ShardCount > 0
@@ -268,7 +277,19 @@ func selectChunkSeriesSet(ctx context.Context, sortSeries bool, hints *storage.S
 	if sortSeries {
 		p = index.SortedPostings(p)
 	}
-	return NewBlockChunkSeriesSet(blockID, index, chunks, tombstones, p, mint, maxt, disableTrimming)
+	return &blockChunkSeriesSet{
+		blockBaseSeriesSet{
+			blockID:         blockID,
+			index:           index,
+			chunks:          chunks,
+			tombstones:      tombstones,
+			p:               p,
+			mint:            mint,
+			maxt:            maxt,
+			disableTrimming: disableTrimming,
+			logger:          logger,
+		},
+	}
 }
 
 // PostingsForMatchers assembles a single postings iterator against the index reader
@@ -577,6 +598,7 @@ type blockBaseSeriesSet struct {
 	tombstones      tombstones.Reader
 	mint, maxt      int64
 	disableTrimming bool
+	logger          *slog.Logger
 
 	curr seriesData
 
@@ -688,6 +710,7 @@ func (*blockBaseSeriesSet) Warnings() annotations.Annotations { return nil }
 type populateWithDelGenericSeriesIterator struct {
 	blockID ulid.ULID
 	cr      ChunkReader
+	logger  *slog.Logger
 	// metas are expected to be sorted by minTime and should be related to
 	// the same, single series.
 	// It's possible for a single chunks.Meta to refer to multiple chunks.
@@ -705,11 +728,19 @@ type populateWithDelGenericSeriesIterator struct {
 	// the chunk returned from cr.ChunkOrIterable(). As that can return a nil
 	// chunk, currMeta.Chunk is not always guaranteed to be set.
 	currMeta chunks.Meta
+
+	// rejectionLogged ensures a rejected chunk is logged only once per
+	// iterator.
+	rejectionLogged bool
 }
 
-func (p *populateWithDelGenericSeriesIterator) reset(blockID ulid.ULID, cr ChunkReader, chks []chunks.Meta, intervals tombstones.Intervals) {
+func (p *populateWithDelGenericSeriesIterator) reset(blockID ulid.ULID, cr ChunkReader, chks []chunks.Meta, intervals tombstones.Intervals, logger *slog.Logger) {
 	p.blockID = blockID
 	p.cr = cr
+	p.logger = logger
+	if p.logger == nil {
+		p.logger = promslog.NewNopLogger()
+	}
 	p.metas = chks
 	p.i = -1
 	p.err = nil
@@ -718,6 +749,33 @@ func (p *populateWithDelGenericSeriesIterator) reset(blockID ulid.ULID, cr Chunk
 	p.intervals = intervals
 	p.currDelIter = nil
 	p.currMeta = chunks.Meta{}
+	p.rejectionLogged = false
+}
+
+// chunkLocation returns a human-readable location of the chunk currently
+// referenced by currMeta. For chunks read from a persisted block, the chunk
+// reference is unpacked into the segment index and the offset of the chunk
+// within the segment, so that a rejected chunk can be extracted from the
+// segment file, e.g. to add it to a regression corpus.
+func (p *populateWithDelGenericSeriesIterator) chunkLocation() string {
+	if _, ok := p.cr.(blockChunkReader); ok {
+		segment, offset := chunks.BlockChunkRef(p.currMeta.Ref).Unpack()
+		return fmt.Sprintf("chunk ref %d (segment %d, offset %d)", p.currMeta.Ref, segment, offset)
+	}
+	return fmt.Sprintf("chunk ref %d", p.currMeta.Ref)
+}
+
+// rejectChunk records err as the iterator's error, wrapped with the block
+// and chunk location. Rejections of histogram chunks declaring too many
+// buckets are additionally logged once per iterator, so that a corrupt or
+// crafted chunk can be located and extracted.
+func (p *populateWithDelGenericSeriesIterator) rejectChunk(err error) {
+	if errors.Is(err, chunkenc.ErrHistogramChunkTooManyBuckets) && !p.rejectionLogged {
+		p.rejectionLogged = true
+		p.logger.Warn("Rejected histogram chunk declaring too many buckets; the chunk is corrupt or was crafted",
+			"block", p.blockID.String(), "location", p.chunkLocation(), "err", err.Error())
+	}
+	p.err = fmt.Errorf("block %s, %s: %w", p.blockID, p.chunkLocation(), err)
 }
 
 // If copyHeadChunk is true, then the head chunk (i.e. the in-memory chunk of the TSDB)
@@ -797,6 +855,7 @@ type blockSeriesEntry struct {
 	chunks  ChunkReader
 	blockID ulid.ULID
 	seriesData
+	logger *slog.Logger
 }
 
 func (s *blockSeriesEntry) Iterator(it chunkenc.Iterator) chunkenc.Iterator {
@@ -804,7 +863,7 @@ func (s *blockSeriesEntry) Iterator(it chunkenc.Iterator) chunkenc.Iterator {
 	if !ok {
 		pi = &populateWithDelSeriesIterator{}
 	}
-	pi.reset(s.blockID, s.chunks, s.chks, s.intervals)
+	pi.reset(s.blockID, s.chunks, s.chks, s.intervals, s.logger)
 	return pi
 }
 
@@ -812,6 +871,7 @@ type chunkSeriesEntry struct {
 	chunks  ChunkReader
 	blockID ulid.ULID
 	seriesData
+	logger *slog.Logger
 }
 
 func (s *chunkSeriesEntry) Iterator(it chunks.Iterator) chunks.Iterator {
@@ -819,7 +879,7 @@ func (s *chunkSeriesEntry) Iterator(it chunks.Iterator) chunks.Iterator {
 	if !ok {
 		pi = &populateWithDelChunkSeriesIterator{}
 	}
-	pi.reset(s.blockID, s.chunks, s.chks, s.intervals)
+	pi.reset(s.blockID, s.chunks, s.chks, s.intervals, s.logger)
 	return pi
 }
 
@@ -830,8 +890,8 @@ type populateWithDelSeriesIterator struct {
 	curr chunkenc.Iterator
 }
 
-func (p *populateWithDelSeriesIterator) reset(blockID ulid.ULID, cr ChunkReader, chks []chunks.Meta, intervals tombstones.Intervals) {
-	p.populateWithDelGenericSeriesIterator.reset(blockID, cr, chks, intervals)
+func (p *populateWithDelSeriesIterator) reset(blockID ulid.ULID, cr ChunkReader, chks []chunks.Meta, intervals tombstones.Intervals, logger *slog.Logger) {
+	p.populateWithDelGenericSeriesIterator.reset(blockID, cr, chks, intervals, logger)
 	p.curr = nil
 }
 
@@ -839,6 +899,10 @@ func (p *populateWithDelSeriesIterator) Next() chunkenc.ValueType {
 	if p.curr != nil {
 		if valueType := p.curr.Next(); valueType != chunkenc.ValNone {
 			return valueType
+		}
+		if err := p.curr.Err(); errors.Is(err, chunkenc.ErrHistogramChunkTooManyBuckets) {
+			p.rejectChunk(err)
+			return chunkenc.ValNone
 		}
 	}
 
@@ -850,6 +914,10 @@ func (p *populateWithDelSeriesIterator) Next() chunkenc.ValueType {
 		}
 		if valueType := p.curr.Next(); valueType != chunkenc.ValNone {
 			return valueType
+		}
+		if err := p.curr.Err(); errors.Is(err, chunkenc.ErrHistogramChunkTooManyBuckets) {
+			p.rejectChunk(err)
+			return chunkenc.ValNone
 		}
 	}
 	return chunkenc.ValNone
@@ -916,8 +984,8 @@ type populateWithDelChunkSeriesIterator struct {
 	chunksFromIterableIdx int
 }
 
-func (p *populateWithDelChunkSeriesIterator) reset(blockID ulid.ULID, cr ChunkReader, chks []chunks.Meta, intervals tombstones.Intervals) {
-	p.populateWithDelGenericSeriesIterator.reset(blockID, cr, chks, intervals)
+func (p *populateWithDelChunkSeriesIterator) reset(blockID ulid.ULID, cr ChunkReader, chks []chunks.Meta, intervals tombstones.Intervals, logger *slog.Logger) {
+	p.populateWithDelGenericSeriesIterator.reset(blockID, cr, chks, intervals, logger)
 	p.currMetaWithChunk = chunks.Meta{}
 	p.chunksFromIterable = p.chunksFromIterable[:0]
 	p.chunksFromIterableIdx = -1
@@ -968,6 +1036,10 @@ func (p *populateWithDelChunkSeriesIterator) populateCurrForSingleChunk() bool {
 	valueType := p.currDelIter.Next()
 	if valueType == chunkenc.ValNone {
 		if err := p.currDelIter.Err(); err != nil {
+			if errors.Is(err, chunkenc.ErrHistogramChunkTooManyBuckets) {
+				p.rejectChunk(err)
+				return false
+			}
 			p.err = fmt.Errorf("iterate chunk while re-encoding: %w", err)
 		}
 		return false
@@ -1049,6 +1121,10 @@ func (p *populateWithDelChunkSeriesIterator) populateChunksFromIterable() bool {
 	firstValueType := p.currDelIter.Next()
 	if firstValueType == chunkenc.ValNone {
 		if err := p.currDelIter.Err(); err != nil {
+			if errors.Is(err, chunkenc.ErrHistogramChunkTooManyBuckets) {
+				p.rejectChunk(err)
+				return false
+			}
 			p.err = fmt.Errorf("populateChunksFromIterable: no samples could be read: %w", err)
 			return false
 		}
@@ -1188,9 +1264,10 @@ type blockSeriesSet struct {
 	blockBaseSeriesSet
 }
 
-func newBlockSeriesSet(i IndexReader, c ChunkReader, t tombstones.Reader, p index.Postings, mint, maxt int64, disableTrimming bool) storage.SeriesSet {
+func newBlockSeriesSet(id ulid.ULID, i IndexReader, c ChunkReader, t tombstones.Reader, p index.Postings, mint, maxt int64, disableTrimming bool, logger *slog.Logger) storage.SeriesSet {
 	return &blockSeriesSet{
 		blockBaseSeriesSet{
+			blockID:         id,
 			index:           i,
 			chunks:          c,
 			tombstones:      t,
@@ -1198,6 +1275,7 @@ func newBlockSeriesSet(i IndexReader, c ChunkReader, t tombstones.Reader, p inde
 			mint:            mint,
 			maxt:            maxt,
 			disableTrimming: disableTrimming,
+			logger:          logger,
 		},
 	}
 }
@@ -1208,6 +1286,7 @@ func (b *blockSeriesSet) At() storage.Series {
 		chunks:     b.chunks,
 		blockID:    b.blockID,
 		seriesData: b.curr,
+		logger:     b.logger,
 	}
 }
 
@@ -1229,6 +1308,7 @@ func NewBlockChunkSeriesSet(id ulid.ULID, i IndexReader, c ChunkReader, t tombst
 			mint:            mint,
 			maxt:            maxt,
 			disableTrimming: disableTrimming,
+			logger:          promslog.NewNopLogger(),
 		},
 	}
 }
@@ -1239,6 +1319,7 @@ func (b *blockChunkSeriesSet) At() storage.ChunkSeries {
 		chunks:     b.chunks,
 		blockID:    b.blockID,
 		seriesData: b.curr,
+		logger:     b.logger,
 	}
 }
 

@@ -42,6 +42,7 @@ import (
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage/remote/azuread"
 	"github.com/prometheus/prometheus/storage/remote/googleiam"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
 var (
@@ -1202,6 +1203,13 @@ type TSDBConfig struct {
 	// ChunkEncoding configures per-chunk-type encoding overrides.
 	ChunkEncoding ChunkEncodingConfig `yaml:"chunk_encoding,omitempty"`
 
+	// MaxHistogramBucketsPerChunk limits the number of buckets a single
+	// histogram chunk may declare before the chunk is rejected during
+	// iteration. It guards against corrupt or crafted chunks forcing
+	// excessive memory allocations. 0 means the default
+	// (chunkenc.DefaultMaxHistogramChunkBuckets).
+	MaxHistogramBucketsPerChunk int `yaml:"max_histogram_buckets_per_chunk,omitempty"`
+
 	Retention *TSDBRetentionConfig `yaml:"retention,omitempty"`
 }
 
@@ -1220,6 +1228,13 @@ func (t *TSDBConfig) UnmarshalYAML(unmarshal func(any) error) error {
 		// Valid; no action required.
 	default:
 		return fmt.Errorf("'storage.tsdb.chunk_encoding.floats' must be 'xor' or 'xor2', or the field must be omitted entirely, got %q", t.ChunkEncoding.Floats)
+	}
+
+	if t.MaxHistogramBucketsPerChunk < 0 {
+		return fmt.Errorf("'storage.tsdb.max_histogram_buckets_per_chunk' must be greater than or equal to 0, got %d", t.MaxHistogramBucketsPerChunk)
+	}
+	if t.MaxHistogramBucketsPerChunk > chunkenc.AbsoluteMaxHistogramChunkBuckets {
+		return fmt.Errorf("'storage.tsdb.max_histogram_buckets_per_chunk' must not exceed %d, got %d", chunkenc.AbsoluteMaxHistogramChunkBuckets, t.MaxHistogramBucketsPerChunk)
 	}
 
 	if t.Retention == nil {

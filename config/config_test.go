@@ -2901,6 +2901,14 @@ var expectedErrors = []struct {
 		errMsg:   `'storage.tsdb.chunk_encoding.floats' must be 'xor' or 'xor2', or the field must be omitted entirely, got "XOR2"`,
 	},
 	{
+		filename: "tsdb_max_histogram_buckets_per_chunk_negative.bad.yml",
+		errMsg:   `'storage.tsdb.max_histogram_buckets_per_chunk' must be greater than or equal to 0, got -1`,
+	},
+	{
+		filename: "tsdb_max_histogram_buckets_per_chunk_too_large.bad.yml",
+		errMsg:   `'storage.tsdb.max_histogram_buckets_per_chunk' must not exceed 1048576, got 1048577`,
+	},
+	{
 		filename: "metric_name_validation_scheme.bad.yml",
 		errMsg:   "unrecognized ValidationScheme: \"invalid_scheme\"",
 	},
@@ -2951,6 +2959,17 @@ func TestTSDBChunkEncoding(t *testing.T) {
 	c, err := Load("", promslog.NewNopLogger())
 	require.NoError(t, err)
 	require.Empty(t, c.StorageConfig.TSDBConfig.ChunkEncoding.Floats)
+}
+
+func TestTSDBMaxHistogramBucketsPerChunk(t *testing.T) {
+	c, err := LoadFile("testdata/tsdb_max_histogram_buckets_per_chunk.good.yml", false, promslog.NewNopLogger())
+	require.NoError(t, err)
+	require.Equal(t, 8192, c.StorageConfig.TSDBConfig.MaxHistogramBucketsPerChunk)
+
+	// Empty/absent value is also valid and means the default.
+	c, err = Load("", promslog.NewNopLogger())
+	require.NoError(t, err)
+	require.Zero(t, c.StorageConfig.TSDBConfig.MaxHistogramBucketsPerChunk)
 }
 
 func TestBadStaticConfigsYML(t *testing.T) {

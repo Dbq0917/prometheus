@@ -26,6 +26,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
@@ -265,7 +266,7 @@ func TestCorruptedChunk(t *testing.T) {
 			require.True(t, set.Next())
 			it := set.At().Iterator(nil)
 			require.Equal(t, chunkenc.ValNone, it.Next())
-			require.EqualError(t, it.Err(), tc.iterErr.Error())
+			require.EqualError(t, it.Err(), strings.ReplaceAll(tc.iterErr.Error(), "00000000000000000000000000", b.Meta().ULID.String()))
 		})
 	}
 }

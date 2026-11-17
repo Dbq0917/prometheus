@@ -487,6 +487,11 @@ func (pb *Block) Tombstones() (tombstones.Reader, error) {
 	return blockTombstoneReader{Reader: pb.tombstones, b: pb}, nil
 }
 
+// Logger returns the logger of the block.
+func (pb *Block) Logger() *slog.Logger {
+	return pb.logger
+}
+
 // GetSymbolTableSize returns the Symbol Table Size in the index of this block.
 func (pb *Block) GetSymbolTableSize() uint64 {
 	return pb.symbolTableSize

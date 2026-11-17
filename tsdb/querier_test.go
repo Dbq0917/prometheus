@@ -14,9 +14,11 @@
 package tsdb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand"
 	"path/filepath"
@@ -1774,7 +1776,7 @@ func TestPopulateWithTombSeriesIterators(t *testing.T) {
 					f, chkMetas = createFakeReaderAndNotPopulatedChunks(tc.samples...)
 				}
 				it := &populateWithDelSeriesIterator{}
-				it.reset(ulid.ULID{}, f, chkMetas, tc.intervals)
+				it.reset(ulid.ULID{}, f, chkMetas, tc.intervals, nil)
 
 				var r []chunks.Sample
 				if tc.seek != 0 {
@@ -1798,7 +1800,7 @@ func TestPopulateWithTombSeriesIterators(t *testing.T) {
 				}
 				f, chkMetas := createFakeReaderAndNotPopulatedChunks(tc.samples...)
 				it := &populateWithDelChunkSeriesIterator{}
-				it.reset(ulid.ULID{}, f, chkMetas, tc.intervals)
+				it.reset(ulid.ULID{}, f, chkMetas, tc.intervals, nil)
 
 				if tc.seek != 0 {
 					// Chunk iterator does not have Seek method.
@@ -1823,7 +1825,7 @@ func TestPopulateWithTombSeriesIterators(t *testing.T) {
 				}
 				f, chkMetas := createFakeReaderAndIterables(tc.samples...)
 				it := &populateWithDelChunkSeriesIterator{}
-				it.reset(ulid.ULID{}, f, chkMetas, tc.intervals)
+				it.reset(ulid.ULID{}, f, chkMetas, tc.intervals, nil)
 
 				if tc.seek != 0 {
 					// Chunk iterator does not have Seek method.
@@ -1913,7 +1915,7 @@ func TestPopulateWithDelSeriesIterator_DoubleSeek(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f, chkMetas := createFakeReaderAndNotPopulatedChunks(tc.chks...)
 			it := &populateWithDelSeriesIterator{}
-			it.reset(ulid.ULID{}, f, chkMetas, nil)
+			it.reset(ulid.ULID{}, f, chkMetas, nil, nil)
 			require.Equal(t, tc.valType, it.Seek(1))
 			require.Equal(t, tc.valType, it.Seek(2))
 			require.Equal(t, tc.valType, it.Seek(2))
@@ -1966,7 +1968,7 @@ func TestPopulateWithDelSeriesIterator_SeekInCurrentChunk(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f, chkMetas := createFakeReaderAndNotPopulatedChunks(tc.chks...)
 			it := &populateWithDelSeriesIterator{}
-			it.reset(ulid.ULID{}, f, chkMetas, nil)
+			it.reset(ulid.ULID{}, f, chkMetas, nil, nil)
 			require.Equal(t, tc.valType, it.Next())
 			checkCurrVal(t, tc.valType, it, 1, 2)
 			require.Equal(t, tc.valType, it.Seek(4))
@@ -2011,7 +2013,7 @@ func TestPopulateWithDelSeriesIterator_SeekWithMinTime(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f, chkMetas := createFakeReaderAndNotPopulatedChunks(tc.chks...)
 			it := &populateWithDelSeriesIterator{}
-			it.reset(ulid.ULID{}, f, chkMetas, nil)
+			it.reset(ulid.ULID{}, f, chkMetas, nil, nil)
 			require.Equal(t, chunkenc.ValNone, it.Seek(7))
 			require.Equal(t, tc.valType, it.Seek(3))
 			require.Equal(t, int64(1), chkMetas[0].MinTime)
@@ -2054,7 +2056,7 @@ func TestPopulateWithDelSeriesIterator_NextWithMinTime(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f, chkMetas := createFakeReaderAndNotPopulatedChunks(tc.chks...)
 			it := &populateWithDelSeriesIterator{}
-			it.reset(ulid.ULID{}, f, chkMetas, tombstones.Intervals{{Mint: math.MinInt64, Maxt: 2}}.Add(tombstones.Interval{Mint: 4, Maxt: math.MaxInt64}))
+			it.reset(ulid.ULID{}, f, chkMetas, tombstones.Intervals{{Mint: math.MinInt64, Maxt: 2}}.Add(tombstones.Interval{Mint: 4, Maxt: math.MaxInt64}), nil)
 			require.Equal(t, chunkenc.ValNone, it.Next())
 			require.Equal(t, int64(1), chkMetas[0].MinTime)
 		})
@@ -2115,7 +2117,7 @@ func TestPopulateWithDelSeriesIterator_WithST(t *testing.T) {
 			t.Run("chunks", func(t *testing.T) {
 				f, chkMetas := createFakeReaderAndNotPopulatedChunks(tc.samples...)
 				it := &populateWithDelSeriesIterator{}
-				it.reset(ulid.ULID{}, f, chkMetas, nil)
+				it.reset(ulid.ULID{}, f, chkMetas, nil, nil)
 
 				var result []chunks.Sample
 				for it.Next() != chunkenc.ValNone {
@@ -2131,7 +2133,7 @@ func TestPopulateWithDelSeriesIterator_WithST(t *testing.T) {
 			t.Run("iterables", func(t *testing.T) {
 				f, chkMetas := createFakeReaderAndIterables(tc.samples...)
 				it := &populateWithDelSeriesIterator{}
-				it.reset(ulid.ULID{}, f, chkMetas, nil)
+				it.reset(ulid.ULID{}, f, chkMetas, nil, nil)
 
 				var result []chunks.Sample
 				for it.Next() != chunkenc.ValNone {
@@ -2221,7 +2223,7 @@ func TestPopulateWithDelChunkSeriesIterator_WithST(t *testing.T) {
 			t.Run("chunks", func(t *testing.T) {
 				f, chkMetas := createFakeReaderAndNotPopulatedChunks(tc.samples...)
 				it := &populateWithDelChunkSeriesIterator{}
-				it.reset(ulid.ULID{}, f, chkMetas, tc.intervals)
+				it.reset(ulid.ULID{}, f, chkMetas, tc.intervals, nil)
 
 				var result []chunks.Sample
 				for it.Next() {
@@ -2242,7 +2244,7 @@ func TestPopulateWithDelChunkSeriesIterator_WithST(t *testing.T) {
 			t.Run("iterables", func(t *testing.T) {
 				f, chkMetas := createFakeReaderAndIterables(tc.samples...)
 				it := &populateWithDelChunkSeriesIterator{}
-				it.reset(ulid.ULID{}, f, chkMetas, tc.intervals)
+				it.reset(ulid.ULID{}, f, chkMetas, tc.intervals, nil)
 
 				var result []chunks.Sample
 				for it.Next() {
@@ -3760,7 +3762,7 @@ func TestBlockBaseSeriesSet(t *testing.T) {
 		i := 0
 		for bcs.Next() {
 			si := populateWithDelGenericSeriesIterator{}
-			si.reset(bcs.blockID, bcs.chunks, bcs.curr.chks, bcs.curr.intervals)
+			si.reset(bcs.blockID, bcs.chunks, bcs.curr.chks, bcs.curr.intervals, nil)
 			idx := tc.expIdxs[i]
 
 			require.Equal(t, tc.series[idx].lset, bcs.curr.labels)
@@ -4540,4 +4542,72 @@ func TestSearchLabelValuesLimitAcrossMergedQueriers(t *testing.T) {
 		Limit:   2,
 	})
 	requireSearchValues(t, rs, []string{"a_metric", "m_metric"})
+}
+
+// TestBlockQuerierRejectsHistogramChunkWithTooManyBuckets checks that a
+// histogram chunk declaring more buckets than the configured limit is
+// rejected during querying, that the error locates the block, the segment
+// and the chunk, and that the rejection is logged.
+func TestBlockQuerierRejectsHistogramChunkWithTooManyBuckets(t *testing.T) {
+	// The generated series produce chunks declaring 4 buckets each.
+	series := genHistogramSeries(1, 1, 0, 10, 1, false)
+	blockDir := createBlock(t, t.TempDir(), series)
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	block, err := OpenBlock(logger, blockDir, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { block.Close() })
+
+	defer chunkenc.SetMaxHistogramChunkBuckets(chunkenc.MaxHistogramChunkBuckets())
+	chunkenc.SetMaxHistogramChunkBuckets(2)
+
+	q, err := NewBlockQuerier(block, math.MinInt64, math.MaxInt64)
+	require.NoError(t, err)
+	t.Cleanup(func() { q.Close() })
+
+	ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, defaultLabelName, "0"))
+	require.True(t, ss.Next())
+	it := ss.At().Iterator(nil)
+	for it.Next() != chunkenc.ValNone {
+	}
+	err = it.Err()
+	require.ErrorIs(t, err, chunkenc.ErrHistogramChunkTooManyBuckets)
+	require.Contains(t, err.Error(), block.Meta().ULID.String())
+	require.Contains(t, err.Error(), "segment 0")
+	require.Contains(t, logBuf.String(), "Rejected histogram chunk")
+	require.Contains(t, logBuf.String(), "segment 0")
+}
+
+// TestBlockQuerierHistogramChunkWithinLimitIteratesNormally checks that the
+// bucket count validation does not change the results of a normal query.
+func TestBlockQuerierHistogramChunkWithinLimitIteratesNormally(t *testing.T) {
+	series := genHistogramSeries(1, 1, 0, 10, 1, false)
+	blockDir := createBlock(t, t.TempDir(), series)
+
+	block, err := OpenBlock(nil, blockDir, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { block.Close() })
+
+	// The generated chunks declare 4 buckets each, well within the default
+	// limit. Set an explicit limit that still fits to prove the check is
+	// active but does not affect legitimate chunks.
+	defer chunkenc.SetMaxHistogramChunkBuckets(chunkenc.MaxHistogramChunkBuckets())
+	chunkenc.SetMaxHistogramChunkBuckets(4)
+
+	q, err := NewBlockQuerier(block, math.MinInt64, math.MaxInt64)
+	require.NoError(t, err)
+	t.Cleanup(func() { q.Close() })
+
+	ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, defaultLabelName, "0"))
+	require.True(t, ss.Next())
+	it := ss.At().Iterator(nil)
+	count := 0
+	for it.Next() != chunkenc.ValNone {
+		count++
+	}
+	require.NoError(t, it.Err())
+	require.Equal(t, 10, count)
+	require.False(t, ss.Next())
+	require.NoError(t, ss.Err())
 }

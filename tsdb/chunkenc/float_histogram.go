@@ -1024,6 +1024,14 @@ func (it *floatHistogramIterator) Next() ValueType {
 		it.zThreshold = zeroThreshold
 		it.pSpans, it.nSpans = posSpans, negSpans
 		it.customValues = customValues
+		// Validate the declared bucket counts against the remaining chunk
+		// size and the configured limit before allocating anything based
+		// on them. A corrupt or crafted chunk could otherwise force the
+		// allocation of several GiB.
+		if err := validateHistogramChunkBucketCounts(posSpans, negSpans, it.br.remainingBits()); err != nil {
+			it.err = err
+			return ValNone
+		}
 		numPBuckets, numNBuckets := countSpans(posSpans), countSpans(negSpans)
 		// Allocate bucket slices as needed, recycling existing slices
 		// in case this iterator was reset and already has slices of a

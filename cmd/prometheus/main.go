@@ -842,6 +842,7 @@ func main() {
 	}
 	cfg.tsdb.OutOfOrderTimeWindow = cfgFile.StorageConfig.TSDBConfig.OutOfOrderTimeWindow
 	cfg.tsdb.StaleSeriesCompactionThreshold = cfgFile.StorageConfig.TSDBConfig.StaleSeriesCompactionThreshold
+	applyMaxHistogramChunkBuckets(cfgFile)
 	cfg.tsdb.RetentionDuration = cfgFile.StorageConfig.TSDBConfig.Retention.Time
 	cfg.tsdb.MaxBytes = cfgFile.StorageConfig.TSDBConfig.Retention.Size
 	cfg.tsdb.MaxPercentage = cfgFile.StorageConfig.TSDBConfig.Retention.Percentage
@@ -1814,6 +1815,7 @@ func reloadConfig(filename string, enableExemplarStorage bool, logger *slog.Logg
 	if failed {
 		return fmt.Errorf("one or more errors occurred while applying the new configuration (--config.file=%q)", filename)
 	}
+	applyMaxHistogramChunkBuckets(conf)
 	if err := logLevel.Set(string(conf.Runtime.LogLevel)); err != nil {
 		return fmt.Errorf("applying log level: %w", err)
 	}
@@ -1835,6 +1837,19 @@ func updateGoGC(conf *config.Config, logger *slog.Logger) {
 	} else {
 		os.Setenv("GOGC", "off")
 	}
+}
+
+// applyMaxHistogramChunkBuckets applies
+// storage.tsdb.max_histogram_buckets_per_chunk to the chunkenc package,
+// guarding histogram chunk iteration against corrupt or crafted chunks
+// declaring excessive bucket counts. An absent or zero value restores the
+// default. It is safe to call on every configuration reload.
+func applyMaxHistogramChunkBuckets(conf *config.Config) {
+	maxBuckets := 0
+	if conf.StorageConfig.TSDBConfig != nil {
+		maxBuckets = conf.StorageConfig.TSDBConfig.MaxHistogramBucketsPerChunk
+	}
+	chunkenc.SetMaxHistogramChunkBuckets(maxBuckets)
 }
 
 func startsOrEndsWithQuote(s string) bool {

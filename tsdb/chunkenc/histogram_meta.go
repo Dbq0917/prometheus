@@ -14,10 +14,34 @@
 package chunkenc
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/prometheus/prometheus/model/histogram"
 )
+
+// validateHistogramChunkBucketCounts checks the bucket counts declared by a
+// histogram chunk layout before any memory is allocated based on them. Each
+// bucket requires at least one bit in the chunk encoding, so a count
+// exceeding the number of remaining bits indicates a corrupt or crafted
+// chunk. The count is additionally capped by the configured limit to bound
+// the memory a single chunk can force an iterator to allocate.
+func validateHistogramChunkBucketCounts(posSpans, negSpans []histogram.Span, remainingBits int) error {
+	limit := MaxHistogramChunkBuckets()
+	total := 0
+	for _, spans := range [2][]histogram.Span{posSpans, negSpans} {
+		for _, s := range spans {
+			total += int(s.Length)
+			if total > remainingBits {
+				return fmt.Errorf("%w: chunk declares %d buckets, but only %d bits remain in the chunk", ErrHistogramChunkTooManyBuckets, total, remainingBits)
+			}
+			if total > limit {
+				return fmt.Errorf("%w: chunk declares %d buckets, exceeding the configured limit of %d", ErrHistogramChunkTooManyBuckets, total, limit)
+			}
+		}
+	}
+	return nil
+}
 
 func writeHistogramChunkLayout(
 	b *bstream, schema int32, zeroThreshold float64,
@@ -83,6 +107,12 @@ func readHistogramChunkLayoutSpans(b *bstreamReader) ([]histogram.Span, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Each span requires at least 2 bits (at least 1 for the length and 1
+	// for the offset), so a span count exceeding half the remaining bits
+	// indicates a corrupt or crafted chunk. Reject it before iterating.
+	if num > uint64(b.remainingBits())/2 {
+		return nil, fmt.Errorf("histogram chunk declares %d spans, but only %d bits remain in the chunk", num, b.remainingBits())
+	}
 	for i := 0; i < int(num); i++ {
 		length, err := readVarbitUint(b)
 		if err != nil {
@@ -114,6 +144,12 @@ func readHistogramChunkLayoutCustomBounds(b *bstreamReader) ([]float64, error) {
 	num, err := readVarbitUint(b)
 	if err != nil {
 		return nil, err
+	}
+	// Each custom bound requires at least 1 bit, so a bound count exceeding
+	// the remaining bits indicates a corrupt or crafted chunk. Reject it
+	// before iterating.
+	if num > uint64(b.remainingBits()) {
+		return nil, fmt.Errorf("histogram chunk declares %d custom bounds, but only %d bits remain in the chunk", num, b.remainingBits())
 	}
 	for i := 0; i < int(num); i++ {
 		bound, err := readCustomBound(b)

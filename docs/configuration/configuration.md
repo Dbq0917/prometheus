@@ -4439,6 +4439,23 @@ with this feature.
 [ chunk_encoding:
   [ floats: <string> ] ]
 
+# Limits the number of buckets a single histogram chunk may declare before
+# the chunk is rejected during iteration. This guards against corrupt or
+# crafted chunks forcing excessive memory allocations (potentially several
+# GiB from a handful of bytes), which can OOM-kill the process. Rejected
+# chunks are logged with their block, segment and offset so they can be
+# investigated.
+#
+# The default of 4096 is conservative: legitimate native histograms rarely
+# exceed a few hundred buckets. Raising this limit increases the amount of
+# memory a single chunk can make a query allocate (roughly 50B per bucket
+# per iterator), re-exposing the process to the memory pressure this guard
+# protects against, so it should only be raised on machines with enough
+# headroom and when histograms with more buckets are genuinely expected.
+# The value cannot exceed 1048576. 0 means the default.
+# This field is runtime-reloadable.
+[ max_histogram_buckets_per_chunk: <int> | default = 0 ]
+
 # Configures data retention settings for TSDB.
 #
 # Note: When retention is changed at runtime, the retention

@@ -2051,6 +2051,11 @@ func (h *RangeHead) Tombstones() (tombstones.Reader, error) {
 	return h.head.tombstones, nil
 }
 
+// Logger returns the logger of the head.
+func (h *RangeHead) Logger() *slog.Logger {
+	return h.head.logger
+}
+
 func (h *RangeHead) MinTime() int64 {
 	return h.mint
 }

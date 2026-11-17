@@ -161,6 +161,12 @@ func newBReader(b []byte) bstreamReader {
 	}
 }
 
+// remainingBits returns the number of bits that can still be read from the
+// stream.
+func (b *bstreamReader) remainingBits() int {
+	return int(b.valid) + (len(b.stream)-b.streamOffset)*8
+}
+
 func (b *bstreamReader) readBit() (bit, error) {
 	if b.valid == 0 {
 		if !b.loadNextBuffer(1) {
